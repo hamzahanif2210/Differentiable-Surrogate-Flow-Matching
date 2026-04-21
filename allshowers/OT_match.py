@@ -16,9 +16,8 @@ import yaml
 from allshowers import preprocessing
 
 start = time.time()
-batch_type = tuple[
-    npt.NDArray[np.float32], npt.NDArray[np.bool_], npt.NDArray[np.int64]
-]
+# batch_type: (points, mask) — points shape (batch, 4, n_points)
+batch_type = tuple[npt.NDArray[np.float32], npt.NDArray[np.bool_]]
 
 
 def print_time(*args, **kwargs) -> None:
@@ -30,7 +29,7 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Match noise to points using OT and save it to the file."
-            "The mapping is done for each shower and each layer separately."
+            "The mapping is done per shower across all hits (no layer partitioning)."
         )
     )
     parser.add_argument(
@@ -53,19 +52,19 @@ class PreProcessor:
         )
         self.file_path, showers, self.data_shape = self.__get_data(config)
         showers = torch.from_numpy(showers)
+        # Energy is at index 3; mask on energy > 0
         mask = showers[:, :, 3] > 0.0
         self.samples_coordinate_trafo.to(showers.dtype)
         self.samples_energy_trafo.to(showers.dtype)
+        # Fit on x, y, z (first 3 columns)
         self.samples_coordinate_trafo.fit(
-            x=showers[:, :, :2],
-            mask=mask[:, :, None].repeat(1, 1, 2),
+            x=showers[:, :, :3],
+            mask=mask[:, :, None].repeat(1, 1, 3),
         )
         self.samples_energy_trafo.fit(
             x=showers[:, :, 3],
             mask=mask,
         )
-        layer = (showers[:, :, 2] + 0.5).to(torch.int64)
-        self.num_layers = int(torch.max(layer).item() + 1)
 
     def __get_data(
         self, config: dict[str, Any]
@@ -82,14 +81,13 @@ class PreProcessor:
         x: npt.NDArray[np.float32],
     ) -> batch_type:
         x_tensor = torch.from_numpy(x)
-        mask = x_tensor[:, 3] > 0.0
-        x_tensor[:, :2] = self.samples_coordinate_trafo(
-            x_tensor[:, :2].permute(0, 2, 1)
+        mask = x_tensor[:, 3] > 0.0                           # (n_points,) per shower
+        x_tensor[:, :3] = self.samples_coordinate_trafo(
+            x_tensor[:, :3].permute(0, 2, 1)
         ).permute(0, 2, 1)
         x_tensor[:, 3] = self.samples_energy_trafo(x_tensor[:, 3])
-        layer = (x_tensor[:, 2] + 0.5).to(torch.int64)
-        x_tensor = x_tensor[:, [0, 1, 3]]
-        return x_tensor.numpy(), mask.numpy(), layer.numpy()
+        # Return all 4 features: x, y, z, energy
+        return x_tensor.numpy(), mask.numpy()
 
 
 class DataLoader(Iterable[npt.NDArray[np.float32]]):
@@ -107,38 +105,32 @@ class DataLoader(Iterable[npt.NDArray[np.float32]]):
 
 class NoiseMatcher:
     def __init__(self, pre_processor: PreProcessor) -> None:
-        self.__num_layers = pre_processor.num_layers
         self.pre_processor = pre_processor
 
     def __call__(self, samples: npt.NDArray[np.float32]) -> npt.NDArray[np.float32]:
-        points, mask, layer = self.pre_processor(samples)
-        noise = np.random.randn(points.shape[0], 3, points.shape[2])
+        points, mask = self.pre_processor(samples)
+        # noise shape matches 4D point features: (batch, 4, n_points)
+        noise = np.random.randn(points.shape[0], 4, points.shape[2])
 
-        for i in range(self.__num_layers):
-            mask_local = np.expand_dims(np.logical_and(mask, layer == i), 1)
-            for j in range(len(points)):
-                points_j = (
-                    points[j].T[mask_local[j].repeat(3).reshape(-1, 3)].reshape(-1, 3)
-                )
-                noise_j = (
-                    noise[j].T[mask_local[j].repeat(3).reshape(-1, 3)].reshape(-1, 3)
-                )
-                if len(points_j) > 1:
-                    N = len(points_j)
-                    assert len(noise_j) == N
-                    M = np.sqrt(
-                        np.sum(
-                            (points_j[:, None, :] - noise_j[None, :, :]) ** 2, axis=-1
-                        )
+        for j in range(len(points)):
+            mask_j = mask[j]                                    # (n_points,)
+            points_j = points[j].T[mask_j]                     # (n_valid, 4)
+            noise_j = noise[j].T[mask_j]                       # (n_valid, 4)
+            if len(points_j) > 1:
+                N = len(points_j)
+                assert len(noise_j) == N
+                M = np.sqrt(
+                    np.sum(
+                        (points_j[:, None, :] - noise_j[None, :, :]) ** 2, axis=-1
                     )
-                    wa = np.ones(N) / N
-                    wb = np.ones(N) / N
-                    T = ot.emd(wa, wb, M)
-                    noise_j = N * (T @ noise_j)
-                    noise[j].T[mask_local[j].repeat(3).reshape(-1, 3)] = (
-                        noise_j.flatten()
-                    )
-        noise[(~mask[:, None, :]).repeat(3, axis=1)] = 0.0
+                )
+                wa = np.ones(N) / N
+                wb = np.ones(N) / N
+                T = ot.emd(wa, wb, M)
+                noise_j = N * (T @ noise_j)
+                noise[j].T[mask_j] = noise_j
+
+        noise[(~mask[:, None, :]).repeat(4, axis=1)] = 0.0
         return noise.astype(np.float32, copy=False)
 
 
@@ -154,7 +146,7 @@ def process_file(
     sys.stdout.flush()
 
     noise_matcher = NoiseMatcher(pre_processor)
-    noise = np.empty((data_shape[0], 3, data_shape[1]), dtype=np.float32)
+    noise = np.empty((data_shape[0], 4, data_shape[1]), dtype=np.float32)
     print_time(f"NoiseMatcher initialized. (noise shape={noise.shape})")
     sys.stdout.flush()
 

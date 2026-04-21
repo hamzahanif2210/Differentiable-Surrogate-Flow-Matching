@@ -99,8 +99,8 @@ class TestDataSets(unittest.TestCase):
                     "num_points",
                 },
             )
-            self.assertLess(torch.min(data["x"][:, :, 2]).item(), 0)
-            self.assertEqual(tuple(data["x"].shape)[0:3:2], (2, 3))
+            # x has 4 features: x, y, z, energy
+            self.assertEqual(tuple(data["x"].shape)[0:3:2], (2, 4))
         for data in val_loader:
             self.assertEqual(
                 set(data.keys()),
@@ -116,7 +116,7 @@ class TestDataSets(unittest.TestCase):
             )
         self.assertEqual(
             set(trafos.keys()),
-            {"samples_energy_trafo", "samples_coordinate_trafo", "cond_trafo"},
+            {"samples_energy_trafo", "samples_coordinate_trafo", "cond_trafo", "cellsize_trafo"},
         )
         for element in trafos.values():
             self.assertTrue(isinstance(element, nn.Module))
@@ -125,7 +125,7 @@ class TestDataSets(unittest.TestCase):
         data = data_sets.load_data("data/showers.h5", start=0, stop=50)
         self.assertEqual(type(data), dict)
         self.assertEqual(
-            set(data.keys()), {"shower", "energy", "direction", "pdg", "noise"}
+            set(data.keys()), {"shower", "energy", "cellsize", "material", "noise"}
         )
         self.assertEqual(data["shower"].shape[0], 50)
         self.assertIsNone(data["noise"])
@@ -164,18 +164,16 @@ class TestDataSets(unittest.TestCase):
         self.assertEqual(result.shape[0], 3)
         self.assertEqual(result.dtype, torch.int64)
 
-    def test_load_and_prepare_with_direction(self):
-        data = data_sets.load_and_prepare(
-            path="data/showers.h5",
-            stop=100,
-            return_direction=True,
-        )
-        self.assertEqual(data["cond"].shape[1], 4)
-
     def test_load_and_prepare_mask_application(self):
         data = data_sets.load_and_prepare(path="data/showers.h5", stop=50)
-        x_masked = data["x"][~data["mask"].repeat(1, 1, 3)]
+        # x now has 4 features
+        x_masked = data["x"][~data["mask"].repeat(1, 1, 4)]
         self.assertEqual(torch.count_nonzero(x_masked), 0)
+
+    def test_load_and_prepare_cond_shape(self):
+        # condition: primaryE (1) + cellsize (3) + material (1) = 5
+        data = data_sets.load_and_prepare(path="data/showers.h5", stop=50)
+        self.assertEqual(data["cond"].shape[1], 5)
 
     def test_get_data_loaders_split(self):
         config_dataset = {
@@ -208,6 +206,7 @@ class TestDataSets(unittest.TestCase):
             "samples_energy_trafo": [["Identity", {}]],
             "samples_coordinate_trafo": [["Identity", {}]],
             "cond_trafo": [["Identity", {}]],
+            "cellsize_trafo": [["Identity", {}]],
             "stop": 20,
         }
         _, _, trafos = data_sets.get_data_loaders(config_dataset, 5)
@@ -218,7 +217,8 @@ class TestDataSets(unittest.TestCase):
         train_loader, _, _ = data_sets.get_data_loaders(config_dataset, 10)
         for batch in train_loader:
             self.assertLessEqual(batch["x"].shape[0], 10)
-            self.assertEqual(batch["x"].shape[2], 3)
+            # x has 4 features: x, y, z, energy
+            self.assertEqual(batch["x"].shape[2], 4)
             break
 
     def test_get_data_loaders_distributed(self):
@@ -257,14 +257,17 @@ class TestDataSets(unittest.TestCase):
         self.assertEqual(val_samples_1, 0)
 
     def test_load_and_prepare_layer_encoding(self):
+        # Layer is all zeros (z is in the feature vector, no discrete layer index)
         data = data_sets.load_and_prepare(path="data/showers.h5", stop=50)
         self.assertEqual(data["layer"].dtype, torch.int64)
-        self.assertTrue(torch.all(data["layer"] >= 0))
+        self.assertTrue(torch.all(data["layer"] == 0))
 
-    def test_load_and_prepare_num_points_default(self):
+    def test_load_and_prepare_num_points_shape(self):
+        # num_points is n_cells: (batch, 1) float scalar per event
         data = data_sets.load_and_prepare(path="data/showers.h5", stop=50)
         self.assertEqual(data["num_points"].shape[0], 50)
-        self.assertEqual(data["num_points"].dtype, torch.int32)
+        self.assertEqual(data["num_points"].shape[1], 1)
+        self.assertEqual(data["num_points"].dtype, torch.float32)
 
 
 if __name__ == "__main__":

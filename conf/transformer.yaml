@@ -6,25 +6,26 @@ data:
     - [Log, {alpha: 0.0}]
     - [StandardScaler, {shape: [1, 1]}]
   samples_coordinate_trafo:
-    - [StandardScaler, {shape: [1, 1, 2]}]
+    - [StandardScaler, {shape: [1, 1, 3]}]
   cond_trafo:
     - [Log, {alpha: 0.0}]
     - [StandardScaler, {shape: [1, 1]}]
+  cellsize_trafo:
+    - [StandardScaler, {shape: [1, 3]}]
   return_noise: True
-  return_direction: True
   val_len: 50000
 
 model:
-  num_layers: 78
-  dim_inputs: [3, 6, 4]
+  num_layers: 1
+  dim_inputs: [4, 6, 5]
   dim_embedding: 64
   num_head: 4
   num_blocks: 4
   dim_feedforward: 256
   num_points_cond: 512
   activation: GELU
-  num_layer_cond: 4
-  num_particles: 12
+  num_layer_cond: -1
+  num_particles: 1
   flow_config:
     frequencies: 3
 
