@@ -13,7 +13,7 @@ from torch import Tensor, nn
 
 from allshowers import flow_matching as fm
 from allshowers import transformer
-from allshowers.data_sets import to_label_tensor
+from allshowers.data_sets import material_to_onehot
 from allshowers.preprocessing import compose
 
 start = time.perf_counter()
@@ -48,10 +48,8 @@ class Generator(nn.Module):
         self.__init_model(run_params["model"], state_dict_file, solver=solver)
         self.__init_trafo(run_params["data"], trafo_file)
         self.to(torch.get_default_dtype())
-        self.feature_last = run_params["data"].get("feature_last", False)
         self.num_layers = run_params["model"].get("num_layers", None)
         self.max_points = run_params["data"].get("max_num_points", 6016)
-        self.expects_angles = run_params["model"]["dim_inputs"][-1] > 1
 
     def __init_model(
         self, params: dict[str, Any], state_file: str, solver: str = "heun"
@@ -80,25 +78,37 @@ class Generator(nn.Module):
         self.samples_energy_trafo = compose(params.get("samples_energy_trafo"))
         self.samples_coordinate_trafo = compose(params.get("samples_coordinate_trafo"))
         self.cond_trafo = compose(params.get("cond_trafo"))
+        self.cellsize_trafo = compose(params.get("cellsize_trafo"))
+        self.n_cells_trafo = compose(params.get("n_cells_trafo"))
 
         state = torch.load(trafo_file, map_location="cpu", weights_only=True)
         self.samples_energy_trafo.load_state_dict(state["samples_energy_trafo"])
         self.samples_coordinate_trafo.load_state_dict(state["samples_coordinate_trafo"])
         self.cond_trafo.load_state_dict(state["cond_trafo"])
+        if "cellsize_trafo" in state:
+            self.cellsize_trafo.load_state_dict(state["cellsize_trafo"])
+        if "n_cells_trafo" in state:
+            self.n_cells_trafo.load_state_dict(state["n_cells_trafo"])
 
     def forward(
         self,
         energies: Tensor,
         num_points: Tensor,
-        angles: Tensor,
+        cellsizes: Tensor,
+        materials: list[str],
+        n_cells_values: Tensor,
         label: Tensor | None = None,
     ) -> Tensor:
-        if self.expects_angles:
-            condition = torch.concatenate(
-                [self.cond_trafo(energies * self.resize_factor), angles], dim=-1
-            )
-        else:
-            condition = self.cond_trafo(energies)
+        primary_e = self.cond_trafo(energies * self.resize_factor)
+        cellsize_scaled = self.cellsize_trafo(cellsizes.to(primary_e.dtype))
+        mat_onehot = material_to_onehot(materials).to(
+            device=primary_e.device, dtype=primary_e.dtype
+        )
+        n_cells_scaled = self.n_cells_trafo(n_cells_values.to(primary_e.dtype))
+        condition = torch.concatenate(
+            [primary_e, cellsize_scaled, mat_onehot, n_cells_scaled], dim=-1
+        )
+
         layer = torch.zeros((condition.shape[0], self.max_points, 1), dtype=torch.int32)
         mask = torch.zeros((condition.shape[0], self.max_points, 1), dtype=torch.bool)
         for i in range(condition.shape[0]):
@@ -143,7 +153,9 @@ def generate(
     generator: Generator,
     energies: Tensor,
     num_points: Tensor,
-    angles: Tensor,
+    cellsizes: Tensor,
+    materials: list[str],
+    n_cells_values: Tensor,
     batch_size: int | None = None,
     device: str | torch.device = "cpu",
     labels: Tensor | None = None,
@@ -152,21 +164,37 @@ def generate(
         batch_size = energies.shape[0]
     split_energies = torch.split(energies, batch_size, dim=0)
     split_num_points = torch.split(num_points, batch_size, dim=0)
-    split_angles = torch.split(angles, batch_size, dim=0)
+    split_cellsizes = torch.split(cellsizes, batch_size, dim=0)
+    split_n_cells = torch.split(n_cells_values, batch_size, dim=0)
+    n_batches = len(split_energies)
+    split_materials = [
+        materials[i * batch_size : (i + 1) * batch_size] for i in range(n_batches)
+    ]
     if labels is not None:
         split_labels = torch.split(labels, batch_size, dim=0)
     else:
-        split_labels = [None] * len(split_energies)
+        split_labels = [None] * n_batches
 
     generator = generator.to(device)
     generator.eval()
     samples = []
-    for i, batch in enumerate(
-        zip(split_energies, split_num_points, split_angles, split_labels)
+    for i, (e, np_, cs, mat, nc, lbl) in enumerate(
+        zip(
+            split_energies,
+            split_num_points,
+            split_cellsizes,
+            split_materials,
+            split_n_cells,
+            split_labels,
+        )
     ):
         print_time(f"start batch {i:3d}")
-        batch = [e.to(device) if e is not None else None for e in batch]
-        samples_l = generator(*batch).cpu()
+        e = e.to(device)
+        np_ = np_.to(device)
+        cs = cs.to(device)
+        nc = nc.to(device)
+        lbl = lbl.to(device) if lbl is not None else None
+        samples_l = generator(e, np_, cs, mat, nc, lbl).cpu()
         samples.append(samples_l)
     samples = torch.cat(samples)
     print_time("generation done")
@@ -181,7 +209,7 @@ def get_args(args: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "cond_file",
-        help="file with the conditioning information (e.g. energies, number of points)",
+        help="file with the conditioning information (e.g. energies, cellsize, material, n_cells)",
     )
     parser.add_argument(
         "-n",
@@ -220,20 +248,12 @@ def get_args(args: list[str] | None = None) -> argparse.Namespace:
         type=str,
         help="ODE solver to use during generation. default: heun",
     )
-    parser.add_argument(
-        "--pdgs",
-        default=[11, -11, 22, 130, 211, -211, 321, -321, 2112, -2112, 2212, -2212],
-        nargs="+",
-        type=int,
-        help="list of pdg codes for the labels. default: [11, -11, 22, 130, 211, -211, 321, -321, 2112, -2112, 2212, -2212]",
-    )
     return parser.parse_args(args)
 
 
 @torch.inference_mode()
 def main(args: list[str] | None = None) -> None:
     parsed_args = get_args(args)
-    parsed_args.pdgs.sort(key=lambda x: (abs(x), -x))
     print_time("start main")
     dtypes = {
         "float16": torch.float16,
@@ -275,20 +295,21 @@ def main(args: list[str] | None = None) -> None:
         parsed_args.cond_file,
         observables=[
             "incident_energies",
-            "incident_pdg",
-            "incident_directions",
+            "cellsize",
+            "material",
+            "n_cells",
             "num_points_per_layer",
         ],
         start=-parsed_args.num_samples,
     )
     energies = torch.from_numpy(cond_data["incident_energies"])
     num_points = torch.from_numpy(cond_data["num_points_per_layer"])
-    angle = torch.from_numpy(cond_data["incident_directions"])
-    pdg = torch.from_numpy(cond_data["incident_pdg"])
-    labels = to_label_tensor(
-        pdg=pdg,
-        label_list=parsed_args.pdgs,
-    )
+    cellsizes = torch.from_numpy(cond_data["cellsize"]).float().reshape(-1, 3)
+    materials = [
+        m.decode("utf-8") if isinstance(m, bytes) else str(m)
+        for m in cond_data["material"]
+    ]
+    n_cells_values = torch.from_numpy(cond_data["n_cells"]).float().reshape(-1, 1)
 
     energies = energies.to(dtype, copy=False)
 
@@ -299,16 +320,15 @@ def main(args: list[str] | None = None) -> None:
         generator,
         energies,
         num_points,
-        angle,
+        cellsizes,
+        materials,
+        n_cells_values,
         parsed_args.batch_size,
         device,
-        labels,
     )
     showers = showerdata.Showers(
         points=samples.numpy(),
         energies=energies.numpy(),
-        directions=angle.numpy(),
-        pdg=pdg.numpy(),
     )
 
     for i in range(100):
