@@ -32,7 +32,7 @@ def material_to_onehot(material: list) -> Tensor:
     for m in material:
         if isinstance(m, bytes):
             m = m.decode("utf-8")
-        m = str(m).strip()
+        m = str(m).strip("\x00 \t\n\r")
         if m not in MATERIAL_TYPES:
             raise ValueError(
                 f"Unknown material '{m}'. Expected one of {MATERIAL_TYPES}"
@@ -158,7 +158,8 @@ def load_data(
         if "material" in f:
             raw = f["material"][start:end]
             material = [
-                m.decode("utf-8") if isinstance(m, bytes) else str(m) for m in raw
+                m.decode("utf-8").strip("\x00 ") if isinstance(m, bytes) else str(m).strip("\x00 ")
+                for m in raw
             ]
         else:
             material = [MATERIAL_TYPES[0]] * n
