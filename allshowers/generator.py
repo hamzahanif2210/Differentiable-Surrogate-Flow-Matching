@@ -143,6 +143,24 @@ class Generator(nn.Module):
         return samples
 
 
+def derive_num_points_per_layer(n_cells: Tensor, num_layers: int) -> Tensor:
+    """Derive num_points_per_layer from total cell counts by uniform distribution.
+
+    Each shower's n_cells hits are spread evenly across num_layers layers.
+    The remainder is given to the first layers.
+    """
+    n = n_cells.shape[0]
+    num_points = torch.zeros(n, num_layers, dtype=torch.int32)
+    for i in range(n):
+        total = max(0, int(n_cells[i].item()))
+        base = total // num_layers
+        remainder = total % num_layers
+        num_points[i] = base
+        if remainder > 0:
+            num_points[i, :remainder] += 1
+    return num_points
+
+
 def print_time(text):
     now = time.perf_counter()
     print(f"[{int(now - start):6d}s]: {text}")
@@ -209,7 +227,11 @@ def get_args(args: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "cond_file",
-        help="file with the conditioning information (e.g. energies, cellsize, material, n_cells)",
+        help=(
+            "path to a showerdata HDF5 file containing: incident_energies, cellsize, "
+            "material, n_cells. num_points_per_layer is optional — if absent it is "
+            "derived from n_cells via uniform distribution across layers."
+        ),
     )
     parser.add_argument(
         "-n",
@@ -291,25 +313,32 @@ def main(args: list[str] | None = None) -> None:
         solver=parsed_args.solver,
         resize_factor=parsed_args.rescale_factor,
     )
+    # Load required conditioning fields; num_points_per_layer is optional
+    required_observables = ["incident_energies", "cellsize", "material", "n_cells"]
+    optional_observables = ["num_points_per_layer"]
     cond_data = showerdata.observables.read_observables_from_file(
         parsed_args.cond_file,
-        observables=[
-            "incident_energies",
-            "cellsize",
-            "material",
-            "n_cells",
-            "num_points_per_layer",
-        ],
+        observables=required_observables + optional_observables,
         start=-parsed_args.num_samples,
     )
     energies = torch.from_numpy(cond_data["incident_energies"])
-    num_points = torch.from_numpy(cond_data["num_points_per_layer"])
     cellsizes = torch.from_numpy(cond_data["cellsize"]).float().reshape(-1, 3)
     materials = [
-        m.decode("utf-8") if isinstance(m, bytes) else str(m)
+        m.decode("utf-8") if isinstance(m, bytes) else str(m).strip("\x00 ")
         for m in cond_data["material"]
     ]
-    n_cells_values = torch.from_numpy(cond_data["n_cells"]).float().reshape(-1, 1)
+    n_cells_raw = torch.from_numpy(cond_data["n_cells"]).long().reshape(-1)
+    n_cells_values = n_cells_raw.float().reshape(-1, 1)
+
+    if "num_points_per_layer" in cond_data and cond_data["num_points_per_layer"] is not None:
+        num_points = torch.from_numpy(cond_data["num_points_per_layer"])
+        print_time("loaded num_points_per_layer from condition file")
+    else:
+        num_points = derive_num_points_per_layer(n_cells_raw, generator.num_layers)
+        print_time(
+            f"derived num_points_per_layer from n_cells "
+            f"(uniform over {generator.num_layers} layers)"
+        )
 
     energies = energies.to(dtype, copy=False)
 
